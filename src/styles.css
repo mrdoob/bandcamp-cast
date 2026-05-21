@@ -1,0 +1,86 @@
+/* ----- Cast button pinned to the inline player (preferred) ------------- */
+/* `position: relative` (with no offsets) just makes the player the
+   containing block for the button — it does not move the player itself. */
+#trackInfoInner > .inline_player {
+  position: relative;
+}
+
+/* Scoped selector (high specificity) so it reliably wins over Bandcamp's
+   own player styles. */
+#trackInfoInner > .inline_player > .bcast-corner {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 10;
+}
+
+.bcast-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: none;
+  color: currentColor;          /* matches the player's theme colour */
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+.bcast-btn svg {
+  display: block;
+  width: 21px;
+  height: 21px;
+  fill: currentColor;
+}
+
+.bcast-btn:hover {
+  opacity: 1;
+}
+
+.bcast-btn.bcast-on {
+  opacity: 1;
+  color: #1da0c3;               /* Cast blue when connected */
+}
+
+/* ----- Floating fallback pill (pages without a standard player) --------- */
+.bcast-bar {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 2147483600;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 15px 7px 9px;
+  background: #ffffff;
+  border: 1px solid #d4d4d4;
+  border-radius: 999px;
+  box-shadow: 0 3px 14px rgba(0, 0, 0, 0.18);
+  font: 700 12px/1 Verdana, Helvetica, Arial, sans-serif;
+  color: #666;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.bcast-bar:hover,
+.bcast-bar.connected {
+  border-color: #1da0c3;
+  color: #1da0c3;
+}
+
+/* Inside the pill the icon is always full-strength. */
+.bcast-bar .bcast-btn {
+  opacity: 1;
+}
+
+.bcast-label {
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
