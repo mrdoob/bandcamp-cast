@@ -20,7 +20,9 @@ is open in a tab, Bandcamp's own player mirrors it — the progress bar and
 play/pause/scrub stay in sync. Skipping tracks and volume are done from Chrome's
 Cast popup.
 
-Uses Google's Default Media Receiver — no account or setup needed.
+Casting goes through a registered Cast receiver app ("Bandcamp Cast") — a
+Styled Media Receiver set up in the Google Cast SDK Developer Console — so the
+Chromecast and phones show that name along with the track and artist.
 
 ## Limitations
 
