@@ -229,7 +229,7 @@
   function onConnected(freshStart) {
     casting = true;
     silenceLocal();
-    if (freshStart) loadQueue(currentLocalTrackId());   // only on a fresh cast
+    if (freshStart) loadQueue(currentLocalTrackId());
     evaluateMirror();
     // On a resumed session (e.g. after a page reload) the RemotePlayer has not
     // synced with the receiver yet, so the evaluateMirror above sees no media.
@@ -241,14 +241,19 @@
   // Poll until the RemotePlayer reflects the receiver's current track, then
   // mirror it — the MEDIA_INFO_CHANGED event can fire before this page's
   // listeners exist, so a resumed session needs this active catch-up.
+  let mirrorSyncTimer = null;
   function syncMirrorFromReceiver(tries = 40) {
+    clearTimeout(mirrorSyncTimer);   // collapse overlapping poll chains into one
     if (!casting || !remotePlayer) return;
     if (remotePlayer.mediaInfo) { evaluateMirror(); return; }
-    if (tries > 0) setTimeout(() => syncMirrorFromReceiver(tries - 1), 250);
+    if (tries > 0) {
+      mirrorSyncTimer = setTimeout(() => syncMirrorFromReceiver(tries - 1), 250);
+    }
   }
 
   function onDisconnected() {
     casting = false;
+    clearTimeout(mirrorSyncTimer);
     if (audioEl) audioEl.muted = false;
     stopMirror();
     updateUI();
@@ -320,7 +325,7 @@
     let startIndex = castable.findIndex((t) => t.id === startId);
     if (startIndex < 0) startIndex = 0;
     // Resume mid-track only when Bandcamp's player is actually on that track.
-    const onStartTrack = audioEl && urlTrackId(audioEl.currentSrc) === startId;
+    const onStartTrack = audioEl && currentLocalTrackId() === startId;
     const startTime = onStartTrack ? audioEl.currentTime || 0 : 0;
 
     // Queue the album from the chosen track onward; send the first chunk now.
@@ -359,9 +364,10 @@
       return;
     }
     const cc = window.chrome.cast;
-    for (let rest = remaining; rest.length; rest = rest.slice(QUEUE_CHUNK)) {
+    for (let i = 0; i < remaining.length; i += QUEUE_CHUNK) {
       if (queuePendingId !== null) return;   // a reload is queued — stop here
-      const req = new cc.media.QueueInsertItemsRequest(rest.slice(0, QUEUE_CHUNK));
+      const req = new cc.media.QueueInsertItemsRequest(
+        remaining.slice(i, i + QUEUE_CHUNK));
       try {
         await new Promise((resolve, reject) => {
           media.queueInsertItems(req, resolve, reject);
@@ -377,6 +383,7 @@
   function waitForMediaSession(ses, tries = 20) {
     return new Promise((resolve) => {
       const tick = (n) => {
+        if (!casting) { resolve(null); return; }
         const media = ses.getMediaSession();
         if (media || n <= 0) { resolve(media || null); return; }
         setTimeout(() => tick(n - 1), 250);
