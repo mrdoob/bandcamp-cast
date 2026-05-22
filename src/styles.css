@@ -46,6 +46,19 @@
   color: #1da0c3;               /* Cast blue when connected */
 }
 
+/* ----- Cast button inside the fan-collection player bar --------------- */
+#carousel-player .bcast-incarousel {
+  width: 24px;
+  height: 24px;
+  align-self: center;
+  margin-right: 6px;
+}
+
+#carousel-player .bcast-incarousel svg {
+  width: 18px;
+  height: 18px;
+}
+
 /* ----- Floating fallback pill (pages without a standard player) --------- */
 .bcast-bar {
   position: fixed;

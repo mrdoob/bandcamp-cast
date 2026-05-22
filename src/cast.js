@@ -39,9 +39,12 @@
   }
 
   const tralbum = getTralbum();
+  // Bandcamp fan pages (a user's collection) carry no tralbum data — they
+  // play tracks through the #carousel-player bar at the bottom of the page.
+  const carousel = document.getElementById('carousel-player');
 
   // Nothing to cast on this page — don't load the SDK or show a button.
-  if (!tralbum && !document.querySelector('audio')) {
+  if (!tralbum && !carousel && !document.querySelector('audio')) {
     console.log(LOG, 'no Bandcamp player found on this page — inactive.');
     return;
   }
@@ -197,6 +200,8 @@
     if (audioEl) return;
     audioEl = el;
     el.addEventListener('play', onLocalPlay);
+    el.addEventListener('pause', onLocalPause);
+    el.addEventListener('seeked', onLocalSeek);
     if (casting) silenceLocal();
   }
 
@@ -209,7 +214,29 @@
     const info = remotePlayer && remotePlayer.mediaInfo;
     const castId = info ? urlTrackId(info.contentId) : '';
     if (wantId && wantId !== castId) loadQueue(wantId);
-    silenceLocal();   // keep Bandcamp's own player from competing with the cast
+    else if (carouselCasting() && remotePlayer.isPaused) remoteController.playOrPause();
+    silenceLocal();
+  }
+
+  // True while the fan-collection player is the user's remote: its muted
+  // local <audio> stays live and its play / pause / seek drive the cast.
+  function carouselCasting() {
+    return casting && !!carousel && !!remotePlayer;
+  }
+
+  // Mirror the fan-collection player's pause and seek onto the cast.
+  function onLocalPause() {
+    if (!carouselCasting() || remotePlayer.isPaused) return;
+    remoteController.playOrPause();
+  }
+
+  function onLocalSeek() {
+    if (!carouselCasting() || !remotePlayer.duration) return;
+    const info = remotePlayer.mediaInfo;
+    if (!info || currentLocalTrackId() !== urlTrackId(info.contentId)) return;
+    if (Math.abs(audioEl.currentTime - (remotePlayer.currentTime || 0)) < 1) return;
+    remotePlayer.currentTime = audioEl.currentTime;
+    remoteController.seek();
   }
 
   // The numeric track ID Bandcamp's <audio> is currently on, or '' if unknown.
@@ -220,7 +247,9 @@
   function silenceLocal() {
     if (!audioEl) return;
     audioEl.muted = true;
-    audioEl.pause();
+    // Bandcamp's fan-collection player retries play() whenever its <audio> is
+    // paused, which fights us into a re-cast loop — so there, mute only.
+    if (!carousel) audioEl.pause();
   }
 
   // -------------------------------------------------------- session lifecycle
@@ -278,6 +307,22 @@
     return new cc.media.QueueItem(info);
   }
 
+  // Wrap queue items in a LoadRequest — used by both the album queue and the
+  // single fan-collection track.
+  function buildLoadRequest(items, startTime) {
+    const cc = window.chrome.cast;
+    const queueData = new cc.media.QueueData();
+    queueData.items = items;
+    queueData.startIndex = 0;
+    queueData.name = albumTitle;
+    queueData.repeatMode = cc.media.RepeatMode.OFF;
+    const request = new cc.media.LoadRequest(items[0].media);
+    request.queueData = queueData;
+    request.currentTime = startTime;
+    request.autoplay = true;
+    return request;
+  }
+
   // Casting is serialised through loadQueue(). Two things make that necessary:
   // Bandcamp fires 'play' twice on a track switch, and two overlapping
   // loadMedia calls make the receiver reject one with `session_error`. While a
@@ -316,10 +361,9 @@
   async function loadQueueFrom(startId) {
     const ses = session();
     if (!ses) return;
-    const cc = window.chrome.cast;
 
     const castable = tracks.filter((t) => t.url);
-    if (!castable.length) { loadSingle(ses); return; }
+    if (!castable.length) { await loadSingle(ses); return; }
 
     // Start at the requested track; fall back to the album's first track.
     let startIndex = castable.findIndex((t) => t.id === startId);
@@ -332,19 +376,8 @@
     const items = castable.slice(startIndex).map(buildQueueItem);
     const first = items.slice(0, QUEUE_CHUNK);
 
-    const queueData = new cc.media.QueueData();
-    queueData.items = first;
-    queueData.startIndex = 0;
-    queueData.name = albumTitle;
-    queueData.repeatMode = cc.media.RepeatMode.OFF;
-
-    const request = new cc.media.LoadRequest(first[0].media);
-    request.queueData = queueData;
-    request.currentTime = startTime;
-    request.autoplay = true;
-
     try {
-      await ses.loadMedia(request);
+      await ses.loadMedia(buildLoadRequest(first, startTime));
     } catch (err) {
       console.warn(LOG, 'Failed to start the cast queue:', err);
       return;
@@ -392,26 +425,75 @@
     });
   }
 
-  // Fallback for pages with no track list: cast whatever is playing now.
-  function loadSingle(ses) {
-    const src = audioEl && (audioEl.currentSrc || audioEl.src);
+  // The track shown in the fan-collection player bar, for cast metadata.
+  function carouselNowPlaying() {
+    if (!carousel) return null;
+    const text = (sel) => {
+      const el = carousel.querySelector(sel);
+      return el ? el.textContent.trim() : '';
+    };
+    const img = carousel.querySelector('.now-playing img');
+    return {
+      title: text('.now-playing .info .title'),
+      artist: text('.now-playing .info .artist'),
+      art: img ? img.src : '',
+    };
+  }
+
+  // A castable mp3-128 stream URL for a track, via Bandcamp's embed player.
+  // The fan-collection player streams owner-only mp3-v0, which the Cast
+  // receiver can't fetch; the embed is same-origin, so this needs no extra
+  // permission. Depends on the embed's `data-player-data` markup.
+  async function castableUrlForTrack(trackId) {
+    if (!trackId) return null;
+    try {
+      const res = await fetch(`https://bandcamp.com/EmbeddedPlayer/track=${trackId}/`);
+      const html = await res.text();
+      const m = html.match(/data-player-data="([^"]+)"/);
+      if (!m) return null;
+      const data = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+      const file = ((data.tracks || [])[0] || {}).file;
+      return file ? httpify(file['mp3-128'] || Object.values(file)[0]) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // Fallback for pages with no track list (e.g. a fan collection): cast
+  // whatever the page is playing right now, as a single track.
+  async function loadSingle(ses) {
+    let src = audioEl && (audioEl.currentSrc || audioEl.src);
     if (!src) {
       console.warn(LOG, 'Nothing to cast yet — play a track first, then cast.');
       return;
     }
     const cc = window.chrome.cast;
+
+    // The collection's local <audio> streams owner-only mp3-v0, which the
+    // receiver can't play; fetch a public mp3-128 stream to cast instead.
+    let np = null;
+    if (carousel) {
+      np = carouselNowPlaying();
+      const better = await castableUrlForTrack(urlTrackId(src));
+      if (better) src = better;
+    }
+
     const info = new cc.media.MediaInfo(src, 'audio/mpeg');
     info.streamType = cc.media.StreamType.BUFFERED;
     const meta = new cc.media.MusicTrackMediaMetadata();
-    meta.title = document.title;
-    meta.albumName = albumTitle;
-    if (artUrl) meta.images = [new cc.Image(artUrl)];
+    meta.title = (np && np.title) || document.title;
+    if (np && np.artist) meta.artist = np.artist;
+    if (tralbum) meta.albumName = albumTitle;
+    const art = (np && np.art) || artUrl;
+    if (art) meta.images = [new cc.Image(art)];
     info.metadata = meta;
-    const request = new cc.media.LoadRequest(info);
-    request.autoplay = true;
-    request.currentTime = (audioEl && audioEl.currentTime) || 0;
-    ses.loadMedia(request).catch(
-      (err) => console.warn(LOG, 'loadMedia failed:', err));
+
+    const startTime = (audioEl && audioEl.currentTime) || 0;
+    try {
+      await ses.loadMedia(buildLoadRequest([new cc.media.QueueItem(info)], startTime));
+    } catch (err) {
+      console.warn(LOG, 'loadMedia failed:', err);
+    }
   }
 
   // ----------------------------------------------- mirror onto Bandcamp's player
@@ -615,14 +697,20 @@
     btn.innerHTML = CAST_SVG;
     btn.addEventListener('click', onCastClick);
 
-    // Preferred: pinned to the top-right corner of the album/track heading.
-    const panel = document.querySelector('#name-section');
-    if (panel) {
+    // Preferred placements: the album/track heading, or the fan-collection
+    // player bar. Fall back to a floating pill on any other page.
+    const heading = document.querySelector('#name-section');
+    const controlsExtra = carousel && carousel.querySelector('.controls-extra');
+    if (heading) {
       btn.classList.add('bcast-corner');
-      panel.appendChild(btn);
-      ui = { btn };
+      heading.appendChild(btn);
+      ui = { btn, where: 'the page heading' };
+    } else if (controlsExtra) {
+      btn.classList.add('bcast-incarousel');
+      controlsExtra.insertBefore(btn, controlsExtra.firstChild);
+      ui = { btn, where: 'the collection player' };
     } else {
-      // Fallback: a floating pill for pages without that panel.
+      // Fallback: a floating pill for pages without a standard player.
       const bar = document.createElement('div');
       bar.className = 'bcast-bar';
       const label = document.createElement('span');
@@ -633,11 +721,9 @@
         if (!btn.contains(e.target)) onCastClick();
       });
       document.body.appendChild(bar);
-      ui = { btn, label, bar };
+      ui = { btn, label, bar, where: 'a floating control' };
     }
-    console.log(LOG, ui.bar
-      ? 'Cast button added as a floating control (no heading found).'
-      : 'Cast button added to the page heading.');
+    console.log(LOG, `Cast button added to ${ui.where}.`);
     updateUI();
   }
 
