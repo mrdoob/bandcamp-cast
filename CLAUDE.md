@@ -22,6 +22,8 @@ The receiver is a **Styled Media Receiver** — Google-hosted, so only the app I
 
 **The player mirror** is active only while the cast track belongs to the open page (`mirroring`): `RemotePlayer` events drive Bandcamp's player DOM (display), and capture-phase listeners on its play button / progress bar route input to the cast (control). On page load `cast.js` re-joins any live session and polls the receiver (`syncMirrorFromReceiver`) to re-establish the mirror, because the `RemotePlayer` event that would trigger it can fire before listeners are attached.
 
+**Fan collection pages** (`bandcamp.com/<user>`) have no `data-tralbum`; they are detected by the `#carousel-player` bar. There the extension casts only the currently-playing track (`loadSingle`), not a queue. The collection's local `<audio>` streams owner-only `mp3-v0`, which the receiver can't fetch — `castableUrlForTrack()` fetches a public `mp3-128` stream from Bandcamp's same-origin embed player instead. There is no DOM mirror; the muted local player stays the user's remote, and its play / pause / seek are forwarded to the cast (`carouselCasting()`). `silenceLocal()` only mutes (never pauses) there, because the collection player retries `play()` when paused and would fight the cast.
+
 A few things to know:
 
 - Tracks are matched by Bandcamp's stable numeric `track_id`, never by URL — stream URLs carry rotating tokens and the format key changes after a purchase. `urlTrackId()` extracts the ID from either URL shape Bandcamp uses: a `track_id` query parameter (`stream_redirect` URLs) or the last path segment (`.../stream/<hash>/<format>/<id>`).
