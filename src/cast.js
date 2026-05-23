@@ -538,14 +538,14 @@
     // No click handler — see injectInnerFrame: the user's click is absorbed
     // by the inner iframe overlay so it registers user activation there.
 
-    // Preferred placements: the album/track heading, or the fan-collection
-    // player bar. Fall back to a floating pill on any other page.
-    const heading = document.querySelector('#name-section');
+    // Preferred placements: the album/track inline player, or the fan-
+    // collection player bar. Fall back to a floating pill on any other page.
+    const inlinePlayer = document.querySelector('#trackInfoInner > .inline_player');
     const controlsExtra = carousel && carousel.querySelector('.controls-extra');
-    if (heading) {
+    if (inlinePlayer) {
       btn.classList.add('bcast-corner');
-      heading.appendChild(btn);
-      ui = { btn, where: 'the page heading' };
+      inlinePlayer.appendChild(btn);
+      ui = { btn, where: 'the inline player' };
     } else if (controlsExtra) {
       btn.classList.add('bcast-incarousel');
       controlsExtra.insertBefore(btn, controlsExtra.firstChild);

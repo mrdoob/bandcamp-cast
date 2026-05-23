@@ -1,13 +1,13 @@
-/* ----- Cast button pinned to the album/track heading (preferred) ------- */
-/* `position: relative` (with no offsets) just makes the heading the
-   containing block for the button — it does not move the heading itself. */
-#name-section {
+/* ----- Cast button pinned to the inline player (preferred) ------------- */
+/* `position: relative` (with no offsets) just makes the player the
+   containing block for the button — it does not move the player itself. */
+#trackInfoInner > .inline_player {
   position: relative;
 }
 
 /* Scoped selector (high specificity) so it reliably wins over Bandcamp's
-   own styles. */
-#name-section > .bcast-corner {
+   own player styles. */
+#trackInfoInner > .inline_player > .bcast-corner {
   position: absolute;
   top: 0;
   right: 0;
