@@ -15,10 +15,10 @@ and pick a device — the music streams to your Chromecast.
 ## How it works
 
 Casting hands the whole album to the Chromecast as a queue, so it auto-advances
-and keeps playing when you switch tabs or close the page. While a casting track
-is open in a tab, Bandcamp's own player mirrors it — the progress bar and
-play/pause/scrub stay in sync. Skipping tracks and volume are done from Chrome's
-Cast popup.
+and keeps playing when you switch tabs, close the page, or browse to a
+different artist on Bandcamp. While a casting track is open in a tab, Bandcamp's
+own player mirrors it — the progress bar and play/pause/scrub stay in sync.
+Skipping tracks and volume are done from Chrome's Cast popup.
 
 On a fan's collection page the Cast button sits in the bottom player bar and
 casts the track playing there; play, pause, and seeking from that bar control
