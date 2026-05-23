@@ -1,8 +1,10 @@
 /*
  * Bandcamp Cast — Chromecast support for Bandcamp.
  *
- * Runs in the page's MAIN world (see manifest `world: "MAIN"`) so it can read
- * Bandcamp's track data and inject the Google Cast SDK.
+ * Runs in the page's MAIN world (see manifest `world: "MAIN"`). The Cast SDK
+ * lives in a hidden iframe loaded on `bandcamp.com`, so cast sessions auto-
+ * rejoin across artist subdomains. The outer (per-tab) script handles the UI,
+ * page data, and audio mirroring and talks to the inner frame via postMessage.
  *
  * When casting starts, the whole album is handed to the Chromecast as a
  * queue. The receiver plays and auto-advances on its own, so playback survives
@@ -19,15 +21,30 @@
   window.__bandcampCastInit = true;
 
   const LOG = '[Bandcamp Cast]';
+
+  // Cast receiver: a Styled Media Receiver ("Bandcamp Cast") registered in the
+  // Google Cast SDK Developer Console.
+  const RECEIVER_APP_ID = '629302D0';
+
+  // The hidden iframe we inject on every Bandcamp page (see injectInnerFrame)
+  // hosts the Cast SDK on a shared `bandcamp.com` origin, so cast sessions
+  // auto-rejoin across artist subdomains. Inside it this same content script
+  // runs in a different role: it owns the Cast SDK, the session, and queue
+  // loading, and exposes them to the outer page over postMessage.
+  const inBcastFrame = window !== window.top
+    && location.search.indexOf('bcast=1') >= 0;
+  if (inBcastFrame) {
+    console.log(LOG, 'inner frame loaded — Cast SDK host.');
+    initInner();
+    return;
+  }
+
+  // ============== OUTER (per-tab UI, page data, audio mirror) ===============
+
   const CAST_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M1 ' +
     '18v3h3c0-1.66-1.34-3-3-3zm0-4v2c2.76 0 5 2.24 5 5h2c0-3.87-3.13-7-7-7zm0' +
     '-4v2c4.97 0 9 4.03 9 9h2c0-6.08-4.93-11-11-11zM21 3H3c-1.1 0-2 .9-2 2v3h' +
     '2V5h18v14h-7v2h7c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2z"/></svg>';
-
-  // Cast receiver: a Styled Media Receiver ("Bandcamp Cast") registered in the
-  // Google Cast SDK Developer Console. Casting through a registered app is what
-  // makes the Chromecast and phones show the app name and track metadata.
-  const RECEIVER_APP_ID = '629302D0';
 
   // ---------------------------------------------------------------- page data
   function getTralbum() {
@@ -64,8 +81,7 @@
 
   const httpify = (u) => (u && u.startsWith('//') ? 'https:' + u : u);
 
-  // Pick a streamable URL from a trackinfo `file` object. `mp3-128` is the
-  // usual streaming format, but fall back to whatever else is offered.
+  // Pick a streamable URL from a trackinfo `file` object.
   const streamUrl = (file) => {
     if (!file) return null;
     const u = file['mp3-128'] || file['mp3-v0'] || Object.values(file)[0];
@@ -104,73 +120,81 @@
   };
 
   // -------------------------------------------------------------------- state
-  let castContext = null;
-  let remotePlayer = null;
-  let remoteController = null;
-  let casting = false;
   let audioEl = null;
   let ui = null;
+  let casting = false;
+  let frameWin = null;   // the inner iframe's contentWindow
 
-  // Build the button right away, so it shows even while the Cast SDK is still
-  // loading — and so a missing button unambiguously means the content script
-  // did not run on this page.
-  buildUI();
+  // Player-mirror state. `els` are Bandcamp's own player elements; `mirroring`
+  // is true only while the cast is playing a track that belongs to this page.
+  // Local clock: the receiver reports currentTime only occasionally, so we
+  // interpolate between updates (clockBase/clockWall + a 500ms ticker) to move
+  // the progress bar smoothly.
+  let els = null;
+  let mirroring = false;
+  let scrubbing = false;
+  let highlightedRow = null;
+  let clockBase = 0;
+  let clockWall = 0;
+  let tickTimer = null;
 
-  // --------------------------------------------------------- Cast SDK loading
-  window.__onGCastApiAvailable = (available) => {
-    if (available) initCast();
-    else console.warn(LOG, 'Cast is not available in this browser.');
+  // Mirror of the inner frame's Cast state — kept in sync via 'state' messages
+  // and used as the source of truth for the local UI, controls, and mirror.
+  const cast = {
+    ready: false,
+    isCasting: false,
+    deviceName: null,
+    contentId: null,
+    duration: 0,
+    currentTime: 0,
+    isPaused: true,
   };
 
-  (function loadSdk() {
-    // Inserted via createElement → not "parser-inserted", so it is permitted
-    // even under Bandcamp's `strict-dynamic` Content-Security-Policy.
-    const s = document.createElement('script');
-    s.src = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
-    s.onerror = () => console.warn(LOG, 'Failed to load the Cast SDK.');
-    (document.head || document.documentElement).appendChild(s);
-  })();
+  // Build the button right away, so it shows even while the inner frame is
+  // still loading — and so a missing button unambiguously means the content
+  // script did not run on this page.
+  buildUI();
+  injectInnerFrame();
+  findAudio();
+  setupPlayerMirror();
 
-  function initCast() {
-    const fw = window.cast && window.cast.framework;
-    const cc = window.chrome && window.chrome.cast;
-    if (!fw || !cc) { console.warn(LOG, 'Cast framework unavailable.'); return; }
+  function sendCmd(cmd, data) {
+    if (!frameWin) return;
+    try { frameWin.postMessage({ src: 'bcast-outer', cmd, data: data || {} }, '*'); }
+    catch (e) { /* noop */ }
+  }
 
-    castContext = fw.CastContext.getInstance();
-    castContext.setOptions({
-      receiverApplicationId: RECEIVER_APP_ID,
-      autoJoinPolicy: cc.AutoJoinPolicy.ORIGIN_SCOPED,
+  function injectInnerFrame() {
+    const f = document.createElement('iframe');
+    f.src = 'https://bandcamp.com/?bcast=1';
+    f.style.cssText = 'display:none;position:absolute;width:0;height:0;border:0';
+    f.setAttribute('aria-hidden', 'true');
+    f.setAttribute('tabindex', '-1');
+    (document.body || document.documentElement).appendChild(f);
+    frameWin = f.contentWindow;
+    window.addEventListener('message', (e) => {
+      if (e.source !== f.contentWindow) return;
+      const m = e.data;
+      if (!m || m.src !== 'bcast-inner') return;
+      if (m.type === 'state') onInnerState(m.state);
+      else if (m.type === 'session') {
+        if (m.event === 'started') onConnected(true);
+        else if (m.event === 'resumed') onConnected(false);
+        else if (m.event === 'ended') onDisconnected();
+      } else if (m.type === 'ready') {
+        cast.ready = true;
+        console.log(LOG, 'inner frame ready.');
+        updateUI();
+      }
     });
+  }
 
-    castContext.addEventListener(
-      fw.CastContextEventType.SESSION_STATE_CHANGED,
-      (e) => {
-        const S = fw.SessionState;
-        if (e.sessionState === S.SESSION_STARTED) onConnected(true);
-        else if (e.sessionState === S.SESSION_RESUMED) onConnected(false);
-        else if (e.sessionState === S.SESSION_ENDED) onDisconnected();
-      },
-    );
-
-    // RemotePlayer reflects the receiver's live state; we mirror it onto
-    // Bandcamp's player.
-    remotePlayer = new fw.RemotePlayer();
-    remoteController = new fw.RemotePlayerController(remotePlayer);
-    const RPE = fw.RemotePlayerEventType;
-    remoteController.addEventListener(RPE.CURRENT_TIME_CHANGED, syncClock);
-    remoteController.addEventListener(RPE.DURATION_CHANGED, syncClock);
-    remoteController.addEventListener(RPE.IS_PAUSED_CHANGED, syncClock);
-    remoteController.addEventListener(RPE.PLAYER_STATE_CHANGED, syncClock);
-    remoteController.addEventListener(RPE.MEDIA_INFO_CHANGED, evaluateMirror);
-    remoteController.addEventListener(RPE.IS_MEDIA_LOADED_CHANGED, evaluateMirror);
-
-    findAudio();
-    setupPlayerMirror();
-
-    // Re-attach to a session that outlived a page navigation (don't reload
-    // the queue — just reflect that we're connected).
-    if (castContext.getCurrentSession()) onConnected(false);
-    else updateUI();
+  function onInnerState(state) {
+    const prevContent = cast.contentId;
+    Object.assign(cast, state);
+    if (cast.contentId !== prevContent) evaluateMirror();
+    syncClock();
+    updateUI();
   }
 
   // -------------------------------------------------- local <audio> reference
@@ -211,32 +235,33 @@
     // Pressing play is an explicit "play this": if it isn't the track already
     // casting, switch the cast to this page's album, starting at that track.
     const wantId = currentLocalTrackId();
-    const info = remotePlayer && remotePlayer.mediaInfo;
-    const castId = info ? urlTrackId(info.contentId) : '';
-    if (wantId && wantId !== castId) loadQueue(wantId);
-    else if (carouselCasting() && remotePlayer.isPaused) remoteController.playOrPause();
+    const castId = cast.contentId ? urlTrackId(cast.contentId) : '';
+    if (wantId && wantId !== castId) castWhatThePageWants();
+    else if (carouselCasting() && cast.isPaused) sendCmd('playPause');
     silenceLocal();
   }
 
   // True while the fan-collection player is the user's remote: its muted
   // local <audio> stays live and its play / pause / seek drive the cast.
   function carouselCasting() {
-    return casting && !!carousel && !!remotePlayer;
+    return casting && !!carousel;
   }
 
   // Mirror the fan-collection player's pause and seek onto the cast.
   function onLocalPause() {
-    if (!carouselCasting() || remotePlayer.isPaused) return;
-    remoteController.playOrPause();
+    // Chrome pauses background-tab audio; ignore — only user-initiated
+    // pauses (which require the tab to be visible) should stop the cast.
+    if (document.hidden) return;
+    if (!carouselCasting() || cast.isPaused) return;
+    sendCmd('playPause');
   }
 
   function onLocalSeek() {
-    if (!carouselCasting() || !remotePlayer.duration) return;
-    const info = remotePlayer.mediaInfo;
-    if (!info || currentLocalTrackId() !== urlTrackId(info.contentId)) return;
-    if (Math.abs(audioEl.currentTime - (remotePlayer.currentTime || 0)) < 1) return;
-    remotePlayer.currentTime = audioEl.currentTime;
-    remoteController.seek();
+    if (!carouselCasting() || !cast.duration) return;
+    if (!cast.contentId || currentLocalTrackId() !== urlTrackId(cast.contentId)) return;
+    const t = audioEl.currentTime;
+    if (Math.abs(t - (cast.currentTime || 0)) < 1) return;
+    sendCmd('seek', { time: t });
   }
 
   // The numeric track ID Bandcamp's <audio> is currently on, or '' if unknown.
@@ -253,175 +278,61 @@
   }
 
   // -------------------------------------------------------- session lifecycle
-  function session() { return castContext && castContext.getCurrentSession(); }
-
   function onConnected(freshStart) {
     casting = true;
     silenceLocal();
-    if (freshStart) loadQueue(currentLocalTrackId());
+    if (freshStart) castWhatThePageWants();
     evaluateMirror();
-    // On a resumed session (e.g. after a page reload) the RemotePlayer has not
-    // synced with the receiver yet, so the evaluateMirror above sees no media.
-    // Keep checking until the receiver's current track arrives.
-    syncMirrorFromReceiver();
     updateUI();
-  }
-
-  // Poll until the RemotePlayer reflects the receiver's current track, then
-  // mirror it — the MEDIA_INFO_CHANGED event can fire before this page's
-  // listeners exist, so a resumed session needs this active catch-up.
-  let mirrorSyncTimer = null;
-  function syncMirrorFromReceiver(tries = 40) {
-    clearTimeout(mirrorSyncTimer);   // collapse overlapping poll chains into one
-    if (!casting || !remotePlayer) return;
-    if (remotePlayer.mediaInfo) { evaluateMirror(); return; }
-    if (tries > 0) {
-      mirrorSyncTimer = setTimeout(() => syncMirrorFromReceiver(tries - 1), 250);
-    }
   }
 
   function onDisconnected() {
     casting = false;
-    clearTimeout(mirrorSyncTimer);
     if (audioEl) audioEl.muted = false;
     stopMirror();
     updateUI();
   }
 
-  // A single Cast message can't carry an arbitrarily large queue, so the
-  // queue is loaded in chunks of this many tracks.
-  const QUEUE_CHUNK = 20;
-
-  function buildQueueItem(t) {
-    const cc = window.chrome.cast;
-    const info = new cc.media.MediaInfo(t.url, 'audio/mpeg');
-    info.streamType = cc.media.StreamType.BUFFERED;
-    if (t.duration) info.duration = t.duration;
-    const meta = new cc.media.MusicTrackMediaMetadata();
-    meta.title = t.title || '';
-    meta.artist = t.artist || albumArtist;
-    meta.albumName = albumTitle;
-    if (t.num) meta.trackNumber = t.num;
-    if (artUrl) meta.images = [new cc.Image(artUrl)];
-    info.metadata = meta;
-    return new cc.media.QueueItem(info);
-  }
-
-  // Wrap queue items in a LoadRequest — used by both the album queue and the
-  // single fan-collection track.
-  function buildLoadRequest(items, startTime) {
-    const cc = window.chrome.cast;
-    const queueData = new cc.media.QueueData();
-    queueData.items = items;
-    queueData.startIndex = 0;
-    queueData.name = albumTitle;
-    queueData.repeatMode = cc.media.RepeatMode.OFF;
-    const request = new cc.media.LoadRequest(items[0].media);
-    request.queueData = queueData;
-    request.currentTime = startTime;
-    request.autoplay = true;
-    return request;
-  }
-
-  // Casting is serialised through loadQueue(). Two things make that necessary:
-  // Bandcamp fires 'play' twice on a track switch, and two overlapping
-  // loadMedia calls make the receiver reject one with `session_error`. While a
-  // load runs, queueLoadingId is the track it starts at and queuePendingId
-  // holds a *different* track requested mid-load — applied once the load
-  // finishes, so the latest click wins and duplicate fires are dropped.
-  let queueLoading = false;
-  let queueLoadingId = '';
-  let queuePendingId = null;
-
-  // Hand the album to the receiver as a queue, starting at track `startId`
-  // (or the first track when startId is empty/unknown). The receiver then
-  // plays and auto-advances on its own, independent of this tab.
-  async function loadQueue(startId) {
-    if (queueLoading) {
-      if (startId !== queueLoadingId) queuePendingId = startId;
-      return;
-    }
-    queueLoading = true;
-    try {
-      let id = startId;
-      while (id !== null) {
-        queueLoadingId = id;
-        queuePendingId = null;
-        await loadQueueFrom(id);
-        id = queuePendingId;   // a different track clicked during the load?
-      }
-    } catch (err) {
-      console.warn(LOG, 'Queue load failed:', err);
-    } finally {
-      queueLoading = false;
-      queueLoadingId = '';
-    }
-  }
-
-  async function loadQueueFrom(startId) {
-    const ses = session();
-    if (!ses) return;
-
+  // Tell the inner to cast whatever this page can cast right now.
+  function castWhatThePageWants() {
+    const startTime = (audioEl && audioEl.currentTime) || 0;
     const castable = tracks.filter((t) => t.url);
-    if (!castable.length) { await loadSingle(ses); return; }
-
-    // Start at the requested track; fall back to the album's first track.
-    let startIndex = castable.findIndex((t) => t.id === startId);
-    if (startIndex < 0) startIndex = 0;
-    // Resume mid-track only when Bandcamp's player is actually on that track.
-    const onStartTrack = audioEl && currentLocalTrackId() === startId;
-    const startTime = onStartTrack ? audioEl.currentTime || 0 : 0;
-
-    // Queue the album from the chosen track onward; send the first chunk now.
-    const items = castable.slice(startIndex).map(buildQueueItem);
-    const first = items.slice(0, QUEUE_CHUNK);
-
-    try {
-      await ses.loadMedia(buildLoadRequest(first, startTime));
-    } catch (err) {
-      console.warn(LOG, 'Failed to start the cast queue:', err);
+    if (castable.length) {
+      sendCmd('castAlbum', {
+        tracks: castable,
+        startId: currentLocalTrackId(),
+        startTime,
+        albumTitle,
+        albumArtist,
+        artUrl,
+      });
       return;
     }
-    console.log(LOG, `casting "${albumTitle}" — ${items.length} tracks.`);
-    await appendToQueue(ses, items.slice(QUEUE_CHUNK));
-  }
-
-  // Append the remaining queue items, one chunk at a time.
-  async function appendToQueue(ses, remaining) {
-    if (!remaining.length) return;
-    // loadMedia resolves slightly before the session's media object is
-    // populated, so wait for it rather than dropping the rest of the queue.
-    const media = await waitForMediaSession(ses);
-    if (!media) {
-      console.warn(LOG, 'No media session — cannot extend queue.');
+    const src = audioEl && (audioEl.currentSrc || audioEl.src);
+    if (!src) {
+      console.warn(LOG, 'Nothing to cast yet — play a track first, then cast.');
       return;
     }
-    const cc = window.chrome.cast;
-    for (let i = 0; i < remaining.length; i += QUEUE_CHUNK) {
-      if (queuePendingId !== null) return;   // a reload is queued — stop here
-      const req = new cc.media.QueueInsertItemsRequest(
-        remaining.slice(i, i + QUEUE_CHUNK));
-      try {
-        await new Promise((resolve, reject) => {
-          media.queueInsertItems(req, resolve, reject);
-        });
-      } catch (err) {
-        console.warn(LOG, 'Failed to extend the cast queue:', err);
-        return;
-      }
+    if (carousel) {
+      const np = carouselNowPlaying();
+      sendCmd('castSingle', {
+        src,
+        trackId: urlTrackId(src),
+        title: (np && np.title) || document.title,
+        artist: (np && np.artist) || '',
+        art: (np && np.art) || artUrl,
+        albumName: tralbum ? albumTitle : '',
+        currentTime: startTime,
+        fetchCastable: true,
+      });
+      return;
     }
-  }
-
-  // loadMedia resolves before getMediaSession() is populated; poll briefly.
-  function waitForMediaSession(ses, tries = 20) {
-    return new Promise((resolve) => {
-      const tick = (n) => {
-        if (!casting) { resolve(null); return; }
-        const media = ses.getMediaSession();
-        if (media || n <= 0) { resolve(media || null); return; }
-        setTimeout(() => tick(n - 1), 250);
-      };
-      tick(tries);
+    sendCmd('castSingle', {
+      src,
+      title: document.title,
+      art: artUrl,
+      albumName: tralbum ? albumTitle : '',
+      currentTime: startTime,
     });
   }
 
@@ -440,75 +351,7 @@
     };
   }
 
-  // A castable mp3-128 stream URL for a track, via Bandcamp's embed player.
-  // The fan-collection player streams owner-only mp3-v0, which the Cast
-  // receiver can't fetch; the embed is same-origin, so this needs no extra
-  // permission. Depends on the embed's `data-player-data` markup.
-  async function castableUrlForTrack(trackId) {
-    if (!trackId) return null;
-    try {
-      const res = await fetch(`https://bandcamp.com/EmbeddedPlayer/track=${trackId}/`);
-      const html = await res.text();
-      const m = html.match(/data-player-data="([^"]+)"/);
-      if (!m) return null;
-      const data = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
-      const file = ((data.tracks || [])[0] || {}).file;
-      return file ? httpify(file['mp3-128'] || Object.values(file)[0]) : null;
-    } catch (e) {
-      return null;
-    }
-  }
-
-  // Fallback for pages with no track list (e.g. a fan collection): cast
-  // whatever the page is playing right now, as a single track.
-  async function loadSingle(ses) {
-    let src = audioEl && (audioEl.currentSrc || audioEl.src);
-    if (!src) {
-      console.warn(LOG, 'Nothing to cast yet — play a track first, then cast.');
-      return;
-    }
-    const cc = window.chrome.cast;
-
-    // The collection's local <audio> streams owner-only mp3-v0, which the
-    // receiver can't play; fetch a public mp3-128 stream to cast instead.
-    let np = null;
-    if (carousel) {
-      np = carouselNowPlaying();
-      const better = await castableUrlForTrack(urlTrackId(src));
-      if (better) src = better;
-    }
-
-    const info = new cc.media.MediaInfo(src, 'audio/mpeg');
-    info.streamType = cc.media.StreamType.BUFFERED;
-    const meta = new cc.media.MusicTrackMediaMetadata();
-    meta.title = (np && np.title) || document.title;
-    if (np && np.artist) meta.artist = np.artist;
-    if (tralbum) meta.albumName = albumTitle;
-    const art = (np && np.art) || artUrl;
-    if (art) meta.images = [new cc.Image(art)];
-    info.metadata = meta;
-
-    const startTime = (audioEl && audioEl.currentTime) || 0;
-    try {
-      await ses.loadMedia(buildLoadRequest([new cc.media.QueueItem(info)], startTime));
-    } catch (err) {
-      console.warn(LOG, 'loadMedia failed:', err);
-    }
-  }
-
-  // ----------------------------------------------- mirror onto Bandcamp's player
-  // `els` are Bandcamp's own player elements; `mirroring` is true only while
-  // the cast is playing a track that belongs to this page.
-  let els = null;
-  let mirroring = false;
-  let scrubbing = false;
-  let highlightedRow = null;
-  // Local clock: the receiver reports currentTime only occasionally, so we
-  // interpolate between its updates to move the progress bar smoothly.
-  let clockBase = 0;     // remotePlayer.currentTime at the last receiver update
-  let clockWall = 0;     // Date.now() at that moment
-  let tickTimer = null;
-
+  // ------------------------------------------- mirror onto Bandcamp's player
   function setupPlayerMirror() {
     const player = document.querySelector('.inline_player');
     if (!player) return;
@@ -538,10 +381,10 @@
   }
 
   function onPlayClick(e) {
-    if (!mirroring) return;                 // not ours — let Bandcamp handle it
+    if (!mirroring) return;
     e.preventDefault();
     e.stopImmediatePropagation();
-    remoteController.playOrPause();
+    sendCmd('playPause');
   }
 
   function swallowWhenMirroring(e) {
@@ -551,7 +394,7 @@
   }
 
   function onScrubStart(e) {
-    if (!mirroring || !remotePlayer.duration) return;
+    if (!mirroring || !cast.duration) return;
     e.preventDefault();
     e.stopImmediatePropagation();
     scrubbing = true;
@@ -562,9 +405,8 @@
       document.removeEventListener('mousemove', move, true);
       document.removeEventListener('mouseup', up, true);
       scrubbing = false;
-      const t = fractionFromEvent(ev) * remotePlayer.duration;
-      remotePlayer.currentTime = t;
-      remoteController.seek();
+      const t = fractionFromEvent(ev) * cast.duration;
+      sendCmd('seek', { time: t });
       clockBase = t;             // optimistic — keeps the bar from flicking back
       clockWall = Date.now();
       renderMirror();
@@ -584,8 +426,7 @@
   function evaluateMirror() {
     if (!els) return;
     const wasMirroring = mirroring;
-    const info = remotePlayer && remotePlayer.mediaInfo;
-    const idx = casting && info ? trackIndexForUrl(info.contentId) : -1;
+    const idx = casting && cast.contentId ? trackIndexForUrl(cast.contentId) : -1;
     mirroring = idx >= 0;
 
     if (mirroring) {
@@ -603,22 +444,22 @@
 
   // Snapshot the receiver's reported position; the ticker interpolates from it.
   function syncClock() {
-    clockBase = remotePlayer.currentTime || 0;
+    clockBase = cast.currentTime || 0;
     clockWall = Date.now();
     renderMirror();
   }
 
   // The current playback position, interpolated since the last receiver update.
   function estimatedTime() {
-    if (remotePlayer.isPaused) return clockBase;
-    const dur = remotePlayer.duration || 0;
+    if (cast.isPaused) return clockBase;
+    const dur = cast.duration || 0;
     const est = clockBase + (Date.now() - clockWall) / 1000;
     return dur ? Math.min(est, dur) : est;
   }
 
   // Run a 500ms ticker only while playback is actually advancing.
   function ensureTicker() {
-    const run = mirroring && !remotePlayer.isPaused && !scrubbing;
+    const run = mirroring && !cast.isPaused && !scrubbing;
     if (run && !tickTimer) {
       tickTimer = setInterval(renderMirror, 500);
     } else if (!run && tickTimer) {
@@ -630,24 +471,23 @@
   // Push the (interpolated) position / play state onto Bandcamp's player.
   function renderMirror() {
     if (!mirroring || !els) return;
-    const dur = remotePlayer.duration || 0;
+    const dur = cast.duration || 0;
     const cur = estimatedTime();
     if (!scrubbing) applyFraction(dur ? cur / dur : 0, cur);
     if (els.total) els.total.textContent = formatTime(dur);
     if (els.timeWrap) els.timeWrap.classList.remove('hiddenelem');
     if (els.playbutton) {
-      els.playbutton.classList.toggle('playing', !remotePlayer.isPaused);
+      els.playbutton.classList.toggle('playing', !cast.isPaused);
     }
     ensureTicker();
   }
 
-  // Move the progress bar / thumb / elapsed time to a 0–1 fraction.
   function applyFraction(fraction, time) {
     const pct = (fraction * 100).toFixed(3) + '%';
     if (els.progFill) els.progFill.style.width = pct;
     if (els.thumb) els.thumb.style.left = pct;
     if (els.elapsed) {
-      const t = time != null ? time : fraction * (remotePlayer.duration || 0);
+      const t = time != null ? time : fraction * (cast.duration || 0);
       els.elapsed.textContent = formatTime(t);
     }
   }
@@ -710,7 +550,6 @@
       controlsExtra.insertBefore(btn, controlsExtra.firstChild);
       ui = { btn, where: 'the collection player' };
     } else {
-      // Fallback: a floating pill for pages without a standard player.
       const bar = document.createElement('div');
       bar.className = 'bcast-bar';
       const label = document.createElement('span');
@@ -728,36 +567,303 @@
   }
 
   function onCastClick() {
-    if (!castContext) {
+    if (!cast.ready) {
       console.warn(LOG, 'Cast SDK is still loading — try again in a moment.');
       return;
     }
-    if (casting) {
-      castContext.endCurrentSession(true);
-    } else {
-      // Opens Chrome's device-picker dialog.
-      castContext.requestSession().catch((err) => {
-        const code = (err && err.code) || err;
-        if (code && code !== 'cancel') {
-          console.warn(LOG, 'Could not start casting:', code,
-            '—', (err && err.description) || '', (err && err.details) || '');
-        }
-      });
-    }
+    if (cast.isCasting) sendCmd('endSession');
+    else sendCmd('requestSession');
   }
 
   function updateUI() {
     if (!ui) return;
-    const ses = session();
-    const dev = ses && ses.getCastDevice && ses.getCastDevice();
-    const name = (dev && dev.friendlyName) || '';
-
-    ui.btn.classList.toggle('bcast-on', casting);
-    ui.btn.title = casting
+    const name = cast.deviceName || '';
+    ui.btn.classList.toggle('bcast-on', cast.isCasting);
+    ui.btn.title = cast.isCasting
       ? (name ? `Casting to ${name} — click to stop` : 'Casting — click to stop')
       : 'Cast this album to a device';
 
-    if (ui.bar) ui.bar.classList.toggle('connected', casting);
-    if (ui.label) ui.label.textContent = casting ? (name || 'Casting') : 'Cast';
+    if (ui.bar) ui.bar.classList.toggle('connected', cast.isCasting);
+    if (ui.label) ui.label.textContent = cast.isCasting ? (name || 'Casting') : 'Cast';
+  }
+
+  // ============== INNER (Cast SDK host, runs inside the iframe) =============
+
+  function initInner() {
+    let castContext = null;
+    let remotePlayer = null;
+    let remoteController = null;
+    let fw = null;
+    let cc = null;
+
+    function send(msg) {
+      try { window.parent.postMessage(Object.assign({ src: 'bcast-inner' }, msg), '*'); }
+      catch (e) { /* noop */ }
+    }
+
+    function snapshot() {
+      const ses = castContext && castContext.getCurrentSession();
+      const dev = ses && ses.getCastDevice && ses.getCastDevice();
+      const info = remotePlayer && remotePlayer.mediaInfo;
+      return {
+        isCasting: !!ses,
+        deviceName: (dev && dev.friendlyName) || null,
+        contentId: (info && info.contentId) || null,
+        duration: (remotePlayer && remotePlayer.duration) || 0,
+        currentTime: (remotePlayer && remotePlayer.currentTime) || 0,
+        isPaused: !remotePlayer || remotePlayer.isPaused,
+      };
+    }
+
+    const broadcast = () => send({ type: 'state', state: snapshot() });
+
+    window.addEventListener('message', (e) => {
+      if (e.source !== window.parent) return;
+      const m = e.data;
+      if (!m || m.src !== 'bcast-outer') return;
+      handleCommand(m).catch((err) => console.warn(LOG, '(inner) cmd error:', err));
+    });
+
+    async function handleCommand(m) {
+      if (!castContext) return;
+      const ses = castContext.getCurrentSession();
+      if (m.cmd === 'requestSession') {
+        try { await castContext.requestSession(); }
+        catch (err) {
+          const code = (err && err.code) || err;
+          if (code && code !== 'cancel') {
+            console.warn(LOG, 'Could not start casting:', code,
+              '—', (err && err.description) || '', (err && err.details) || '');
+          }
+        }
+      } else if (m.cmd === 'endSession') {
+        if (ses) castContext.endCurrentSession(true);
+      } else if (m.cmd === 'playPause') {
+        if (remoteController) remoteController.playOrPause();
+      } else if (m.cmd === 'seek') {
+        if (remotePlayer && remoteController) {
+          remotePlayer.currentTime = m.data.time;
+          remoteController.seek();
+        }
+      } else if (m.cmd === 'castAlbum') {
+        if (ses) await dispatchLoad(ses, 'album', m.data);
+      } else if (m.cmd === 'castSingle') {
+        if (ses) await dispatchLoad(ses, 'single', m.data);
+      }
+    }
+
+    // ----- Loading / queueing on the receiver ---------------------------
+    // Serialised: outer can re-issue castAlbum/castSingle rapidly (Bandcamp
+    // fires 'play' twice on a track switch), and two overlapping loadMedia
+    // calls make the receiver reject one with `session_error`.
+    const QUEUE_CHUNK = 20;
+    let castLoading = false;
+    let castLoadingKey = '';
+    let castPending = null;   // { type, data } when a different load is queued
+
+    function keyOf(type, data) {
+      return type === 'album'
+        ? 'album:' + (data.startId || '')
+        : 'single:' + (data.trackId || data.src);
+    }
+
+    async function dispatchLoad(ses, type, data) {
+      const key = keyOf(type, data);
+      if (castLoading) {
+        if (key !== castLoadingKey) castPending = { type, data };
+        return;
+      }
+      castLoading = true;
+      try {
+        let job = { type, data };
+        while (job) {
+          castLoadingKey = keyOf(job.type, job.data);
+          castPending = null;
+          if (job.type === 'album') await loadAlbumQueueFrom(ses, job.data);
+          else await loadSingleTrack(ses, job.data);
+          job = castPending;
+        }
+      } catch (err) { console.warn(LOG, 'Cast load failed:', err); }
+      finally { castLoading = false; castLoadingKey = ''; }
+    }
+
+    function buildQueueItem(t, ctx) {
+      const info = new cc.media.MediaInfo(t.url, 'audio/mpeg');
+      info.streamType = cc.media.StreamType.BUFFERED;
+      if (t.duration) info.duration = t.duration;
+      const meta = new cc.media.MusicTrackMediaMetadata();
+      meta.title = t.title || '';
+      meta.artist = t.artist || ctx.albumArtist || '';
+      if (ctx.albumTitle) meta.albumName = ctx.albumTitle;
+      if (t.num) meta.trackNumber = t.num;
+      const art = t.art || ctx.artUrl;
+      if (art) meta.images = [new cc.Image(art)];
+      info.metadata = meta;
+      return new cc.media.QueueItem(info);
+    }
+
+    // Wrap queue items in a LoadRequest — used by both album queues and the
+    // single fan-collection track.
+    function buildLoadRequest(items, startTime, name) {
+      const queueData = new cc.media.QueueData();
+      queueData.items = items;
+      queueData.startIndex = 0;
+      if (name) queueData.name = name;
+      queueData.repeatMode = cc.media.RepeatMode.OFF;
+      const request = new cc.media.LoadRequest(items[0].media);
+      request.queueData = queueData;
+      request.currentTime = startTime;
+      request.autoplay = true;
+      return request;
+    }
+
+    async function loadAlbumQueueFrom(ses, data) {
+      const castable = (data.tracks || []).filter((t) => t.url);
+      if (!castable.length) return;
+      let startIndex = castable.findIndex((t) => t.id === data.startId);
+      if (startIndex < 0) startIndex = 0;
+      const ctx = {
+        albumArtist: data.albumArtist,
+        albumTitle: data.albumTitle,
+        artUrl: data.artUrl,
+      };
+      const items = castable.slice(startIndex).map((t) => buildQueueItem(t, ctx));
+      const first = items.slice(0, QUEUE_CHUNK);
+      try {
+        await ses.loadMedia(buildLoadRequest(
+          first, data.startTime || 0, data.albumTitle));
+      } catch (err) {
+        console.warn(LOG, 'Failed to start the cast queue:', err);
+        return;
+      }
+      console.log(LOG, `casting "${data.albumTitle}" — ${items.length} tracks.`);
+      await appendToQueue(ses, items.slice(QUEUE_CHUNK));
+    }
+
+    // Append the remaining queue items, one chunk at a time.
+    async function appendToQueue(ses, remaining) {
+      if (!remaining.length) return;
+      // loadMedia resolves slightly before the session's media object is
+      // populated, so wait for it rather than dropping the rest of the queue.
+      const media = await waitForMediaSession(ses);
+      if (!media) {
+        console.warn(LOG, 'No media session — cannot extend queue.');
+        return;
+      }
+      for (let i = 0; i < remaining.length; i += QUEUE_CHUNK) {
+        if (castPending !== null) return;   // a reload is queued — stop here
+        const req = new cc.media.QueueInsertItemsRequest(
+          remaining.slice(i, i + QUEUE_CHUNK));
+        try {
+          await new Promise((resolve, reject) => {
+            media.queueInsertItems(req, resolve, reject);
+          });
+        } catch (err) {
+          console.warn(LOG, 'Failed to extend the cast queue:', err);
+          return;
+        }
+      }
+    }
+
+    // loadMedia resolves before getMediaSession() is populated; poll briefly.
+    function waitForMediaSession(ses, tries = 20) {
+      return new Promise((resolve) => {
+        const tick = (n) => {
+          if (!castContext.getCurrentSession()) { resolve(null); return; }
+          const media = ses.getMediaSession();
+          if (media || n <= 0) { resolve(media || null); return; }
+          setTimeout(() => tick(n - 1), 250);
+        };
+        tick(tries);
+      });
+    }
+
+    // Fan-collection pages (and any other page with no track list): cast
+    // whatever the page is playing right now, as a single track.
+    async function loadSingleTrack(ses, data) {
+      let src = data.src;
+      // Collection pages stream owner-only mp3-v0 which the receiver can't
+      // play; fetch a public mp3-128 stream via the embed player.
+      if (data.fetchCastable && data.trackId) {
+        const better = await castableUrlForTrack(data.trackId);
+        if (better) src = better;
+      }
+      if (!src) return;
+      const info = new cc.media.MediaInfo(src, 'audio/mpeg');
+      info.streamType = cc.media.StreamType.BUFFERED;
+      const meta = new cc.media.MusicTrackMediaMetadata();
+      meta.title = data.title || '';
+      if (data.artist) meta.artist = data.artist;
+      if (data.albumName) meta.albumName = data.albumName;
+      if (data.art) meta.images = [new cc.Image(data.art)];
+      info.metadata = meta;
+      try {
+        await ses.loadMedia(buildLoadRequest(
+          [new cc.media.QueueItem(info)], data.currentTime || 0));
+      } catch (err) { console.warn(LOG, 'loadMedia failed:', err); }
+    }
+
+    // A castable mp3-128 stream URL for a track via Bandcamp's embed player.
+    // The inner is on `bandcamp.com`, so this fetch is same-origin from
+    // anywhere the iframe is loaded.
+    async function castableUrlForTrack(trackId) {
+      if (!trackId) return null;
+      try {
+        const res = await fetch(`https://bandcamp.com/EmbeddedPlayer/track=${trackId}/`);
+        const html = await res.text();
+        const m = html.match(/data-player-data="([^"]+)"/);
+        if (!m) return null;
+        const data = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+        const file = ((data.tracks || [])[0] || {}).file;
+        const u = file && (file['mp3-128'] || Object.values(file)[0]);
+        return u && u.startsWith('//') ? 'https:' + u : (u || null);
+      } catch (e) { return null; }
+    }
+
+    // ----- Cast SDK loading -----
+    window.__onGCastApiAvailable = (available) => {
+      if (available) startCast();
+      else console.warn(LOG, '(inner) Cast is not available in this browser.');
+    };
+
+    function startCast() {
+      fw = window.cast && window.cast.framework;
+      cc = window.chrome && window.chrome.cast;
+      if (!fw || !cc) {
+        console.warn(LOG, '(inner) Cast framework unavailable.');
+        return;
+      }
+      castContext = fw.CastContext.getInstance();
+      castContext.setOptions({
+        receiverApplicationId: RECEIVER_APP_ID,
+        autoJoinPolicy: cc.AutoJoinPolicy.ORIGIN_SCOPED,
+      });
+      castContext.addEventListener(
+        fw.CastContextEventType.SESSION_STATE_CHANGED,
+        (e) => {
+          const S = fw.SessionState;
+          if (e.sessionState === S.SESSION_STARTED) send({ type: 'session', event: 'started' });
+          else if (e.sessionState === S.SESSION_RESUMED) send({ type: 'session', event: 'resumed' });
+          else if (e.sessionState === S.SESSION_ENDED) send({ type: 'session', event: 'ended' });
+          broadcast();
+        },
+      );
+      remotePlayer = new fw.RemotePlayer();
+      remoteController = new fw.RemotePlayerController(remotePlayer);
+      const RPE = fw.RemotePlayerEventType;
+      [RPE.CURRENT_TIME_CHANGED, RPE.DURATION_CHANGED, RPE.IS_PAUSED_CHANGED,
+       RPE.PLAYER_STATE_CHANGED, RPE.MEDIA_INFO_CHANGED, RPE.IS_MEDIA_LOADED_CHANGED]
+        .forEach((evt) => remoteController.addEventListener(evt, broadcast));
+      // Re-attach to a session that outlived a navigation.
+      if (castContext.getCurrentSession()) send({ type: 'session', event: 'resumed' });
+      broadcast();
+      send({ type: 'ready' });
+    }
+
+    // Load the Cast SDK in the iframe.
+    const s = document.createElement('script');
+    s.src = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
+    s.onerror = () => console.warn(LOG, '(inner) Failed to load Cast SDK.');
+    (document.head || document.documentElement).appendChild(s);
   }
 })();

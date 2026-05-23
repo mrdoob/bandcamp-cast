@@ -15,7 +15,8 @@
       "js": ["src/cast.js"],
       "css": ["src/styles.css"],
       "run_at": "document_idle",
-      "world": "MAIN"
+      "world": "MAIN",
+      "all_frames": true
     }
   ]
 }
