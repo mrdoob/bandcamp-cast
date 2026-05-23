@@ -7,10 +7,9 @@ and pick a device — the music streams to your Chromecast.
 
 ## Install
 
-1. Run `python3 tools/make_icons.py` to generate the icons (one-time).
-2. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**,
+1. Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**,
    and select this folder.
-3. Open any Bandcamp album, track, or collection page.
+2. Open any Bandcamp album, track, or collection page.
 
 ## How it works
 
