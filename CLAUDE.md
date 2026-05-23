@@ -14,14 +14,16 @@ A Manifest V3 Chrome extension that adds Chromecast support to Bandcamp. No buil
 
 ## Architecture
 
-The Cast SDK runs in a hidden iframe we inject on every Bandcamp page, pointing to `https://bandcamp.com/?bcast=1`. Album/track pages live on artist subdomains (`<artist>.bandcamp.com`); the iframe loads `bandcamp.com` itself — so the sender's origin is the same on every Bandcamp tab. Cast sessions are `ORIGIN_SCOPED`, so this gives auto-rejoin across artist subdomains: the cast keeps playing and the button on the new page picks it up.
+The Cast SDK runs in an iframe we inject on every Bandcamp page, pointing to `https://bandcamp.com/?bcast=1`. Album/track pages live on artist subdomains (`<artist>.bandcamp.com`); the iframe loads `bandcamp.com` itself — so the sender's origin is the same on every Bandcamp tab. Cast sessions are `ORIGIN_SCOPED`, so this gives auto-rejoin across artist subdomains: the cast keeps playing and the button on the new page picks it up.
+
+The iframe is **overlaid transparently on top of the Cast button** (`position: absolute; inset: 0; opacity: 0`), not hidden off-screen. The reason: Chrome does not propagate user activation cross-origin via `postMessage`, so a click in the outer can't authorise the iframe's `requestSession()`. By routing the click *through* the iframe instead, user activation registers on the `bandcamp.com` frame directly. The inner has its own `click` listener for `requestSession` / `endCurrentSession`; everything else flows over `postMessage`.
 
 The same content script `src/cast.js` runs in both contexts (manifest `all_frames: true`, `world: "MAIN"`) and branches at the top on `inBcastFrame`:
 
 - **Outer** (per tab): UI button, page-data extraction (`data-tralbum`, `#carousel-player`), local `<audio>` capture, and the player mirror onto Bandcamp's own DOM. Holds no Cast SDK objects — only a `cast` state object updated from inner messages.
 - **Inner** (in the iframe, on `bandcamp.com`): owns the Cast SDK, `CastContext`, `RemotePlayer`, the session, and `loadMedia` / queue construction. Broadcasts state on every relevant event.
 
-They talk over `postMessage`. Outer → inner commands: `requestSession`, `endSession`, `playPause`, `seek`, `castAlbum`, `castSingle`. Inner → outer events: `state` (the broadcast snapshot), `session` (`started` / `resumed` / `ended`), and a one-time `ready`.
+They talk over `postMessage`. Outer → inner commands: `playPause`, `seek`, `castAlbum`, `castSingle`. Inner → outer events: `state` (the broadcast snapshot), `session` (`started` / `resumed` / `ended`), and a one-time `ready`. Session start/stop are handled by the inner's click listener directly (it needs the user activation).
 
 The receiver is a **Styled Media Receiver** — Google-hosted, so only the app ID is registered (no receiver URL or hosting to maintain). The SDK script is added in the inner via `createElement`, which Bandcamp's `strict-dynamic` CSP permits — so the extension modifies no CSP and needs zero permissions. A `session_error` when starting a cast means the receiver app didn't launch: usually a freshly published app that hasn't propagated yet (~15 min), or — for an unpublished app — a Cast device not registered for testing, or not rebooted after registering.
 
