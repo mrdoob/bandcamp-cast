@@ -141,7 +141,6 @@
   // Mirror of the inner frame's Cast state — kept in sync via 'state' messages
   // and used as the source of truth for the local UI, controls, and mirror.
   const cast = {
-    ready: false,
     isCasting: false,
     deviceName: null,
     contentId: null,
@@ -154,7 +153,6 @@
   // still loading — and so a missing button unambiguously means the content
   // script did not run on this page.
   buildUI();
-  injectInnerFrame();
   findAudio();
   setupPlayerMirror();
 
@@ -164,13 +162,17 @@
     catch (e) { /* noop */ }
   }
 
-  function injectInnerFrame() {
+  // Transparent iframe overlay on top of the Cast button. Chrome does not
+  // propagate user activation cross-origin via `postMessage`, so the
+  // activation `requestSession()` requires has to register on a frame the
+  // user actually clicked — this is that frame.
+  function injectInnerFrame(parent) {
     const f = document.createElement('iframe');
     f.src = 'https://bandcamp.com/?bcast=1';
-    f.style.cssText = 'display:none;position:absolute;width:0;height:0;border:0';
+    f.style.cssText = 'position:absolute;inset:0;border:0;opacity:0;background:transparent';
     f.setAttribute('aria-hidden', 'true');
     f.setAttribute('tabindex', '-1');
-    (document.body || document.documentElement).appendChild(f);
+    parent.appendChild(f);
     frameWin = f.contentWindow;
     window.addEventListener('message', (e) => {
       if (e.source !== f.contentWindow) return;
@@ -182,9 +184,7 @@
         else if (m.event === 'resumed') onConnected(false);
         else if (m.event === 'ended') onDisconnected();
       } else if (m.type === 'ready') {
-        cast.ready = true;
         console.log(LOG, 'inner frame ready.');
-        updateUI();
       }
     });
   }
@@ -535,7 +535,8 @@
     btn.className = 'bcast-btn';
     btn.setAttribute('aria-label', 'Cast to a device');
     btn.innerHTML = CAST_SVG;
-    btn.addEventListener('click', onCastClick);
+    // No click handler — see injectInnerFrame: the user's click is absorbed
+    // by the inner iframe overlay so it registers user activation there.
 
     // Preferred placements: the album/track heading, or the fan-collection
     // player bar. Fall back to a floating pill on any other page.
@@ -556,23 +557,12 @@
       label.className = 'bcast-label';
       label.textContent = 'Cast';
       bar.append(btn, label);
-      bar.addEventListener('click', (e) => {
-        if (!btn.contains(e.target)) onCastClick();
-      });
       document.body.appendChild(bar);
       ui = { btn, label, bar, where: 'a floating control' };
     }
+    injectInnerFrame(ui.bar || btn);
     console.log(LOG, `Cast button added to ${ui.where}.`);
     updateUI();
-  }
-
-  function onCastClick() {
-    if (!cast.ready) {
-      console.warn(LOG, 'Cast SDK is still loading — try again in a moment.');
-      return;
-    }
-    if (cast.isCasting) sendCmd('endSession');
-    else sendCmd('requestSession');
   }
 
   function updateUI() {
@@ -627,18 +617,7 @@
     async function handleCommand(m) {
       if (!castContext) return;
       const ses = castContext.getCurrentSession();
-      if (m.cmd === 'requestSession') {
-        try { await castContext.requestSession(); }
-        catch (err) {
-          const code = (err && err.code) || err;
-          if (code && code !== 'cancel') {
-            console.warn(LOG, 'Could not start casting:', code,
-              '—', (err && err.description) || '', (err && err.details) || '');
-          }
-        }
-      } else if (m.cmd === 'endSession') {
-        if (ses) castContext.endCurrentSession(true);
-      } else if (m.cmd === 'playPause') {
+      if (m.cmd === 'playPause') {
         if (remoteController) remoteController.playOrPause();
       } else if (m.cmd === 'seek') {
         if (remotePlayer && remoteController) {
@@ -651,6 +630,31 @@
         if (ses) await dispatchLoad(ses, 'single', m.data);
       }
     }
+
+    // User-trusted clicks reach us through the outer's transparent iframe
+    // overlay on the Cast button — see injectInnerFrame in the outer.
+    function onCastClick(e) {
+      if (!e.isTrusted) return;     // ignore programmatic clicks from the
+      e.preventDefault();           // bandcamp.com homepage running in here
+      e.stopPropagation();
+      if (!castContext) {
+        console.warn(LOG, 'Cast SDK is still loading — try again in a moment.');
+        return;
+      }
+      const ses = castContext.getCurrentSession();
+      if (ses) { castContext.endCurrentSession(true); return; }
+      castContext.requestSession().catch((err) => {
+        const code = (err && err.code) || err;
+        if (code && code !== 'cancel') {
+          console.warn(LOG, 'Could not start casting:', code,
+            '—', (err && err.description) || '', (err && err.details) || '');
+        }
+      });
+    }
+    document.addEventListener('click', onCastClick, true);
+    // The iframe is opacity:0 over a button; show its host's pointer cursor
+    // when the user hovers the area.
+    (document.body || document.documentElement).style.cursor = 'pointer';
 
     // ----- Loading / queueing on the receiver ---------------------------
     // Serialised: outer can re-issue castAlbum/castSingle rapidly (Bandcamp

@@ -18,6 +18,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  position: relative;           /* hosts the overlay iframe */
   width: 28px;
   height: 28px;
   padding: 0;
